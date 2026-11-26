@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     auto_create_tables: bool = True
     seed_demo_data: bool = False
 
+    redis_url: str = ""
+    task_execution_mode: Literal["inline", "async", "redis"] = "inline"
+
     llm_default_provider: Literal["mock", "ollama", "gemini"] = "mock"
     llm_fallback_providers: str = "ollama,gemini,mock"
     ollama_base_url: str = "http://localhost:11434"
@@ -35,12 +38,21 @@ class Settings(BaseSettings):
     gemini_default_model: str = "gemini-2.5-flash"
     llm_redact_pii_for_cloud: bool = True
 
+    embedding_provider: Literal["deterministic", "ollama"] = "deterministic"
+    embedding_dimensions: int = 384
+
     price_variance_tolerance_pct: float = 2.0
     qty_variance_tolerance_pct: float = 0.0
     expense_auto_approve_limit: float = 250.0
 
     auth_secret_key: str = _DEFAULT_DEV_SECRET
     auth_require_token: bool = False
+    auth_access_token_ttl_seconds: int = 3600
+    auth_refresh_token_ttl_seconds: int = 604800
+
+    rate_limit_enabled: bool = True
+    rate_limit_requests_per_minute: int = 180
+    otel_enabled: bool = False
 
     @property
     def cors_origin_list(self) -> list[str]:

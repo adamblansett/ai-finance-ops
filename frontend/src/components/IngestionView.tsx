@@ -93,12 +93,12 @@ export function IngestionView({
           <div className="flex items-center gap-2">
             <FileUp className="h-4 w-4 text-indigo-600" />
             <h2 className="text-sm font-semibold text-slate-900">
-              Upload Document (PDF / CSV / JSON)
+              Upload Document (PDF / CSV / JSON / OFX)
             </h2>
           </div>
           <p className="text-xs text-slate-600">
-            Every file is fingerprinted with SHA-256; exact re-uploads are automatically blocked
-            with HTTP 409 and logged to the SOX audit trail.
+            Supports QBO/Xero/NetSuite CSVs, OFX/QFX bank feeds, PDF invoices, and JSON.
+            Every file is fingerprinted with SHA-256; duplicates return HTTP 409.
           </p>
 
           <div className="grid gap-3 sm:grid-cols-2">
@@ -132,7 +132,7 @@ export function IngestionView({
             Select File
             <input
               type="file"
-              accept=".csv,.json,.pdf"
+              accept=".csv,.json,.pdf,.ofx,.qfx"
               onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
               className="mt-1 block w-full text-xs text-slate-600 file:mr-3 file:rounded-md file:border-0 file:bg-indigo-50 file:px-3 file:py-1.5 file:text-xs file:font-semibold file:text-indigo-700 hover:file:bg-indigo-100"
             />

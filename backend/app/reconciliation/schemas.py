@@ -54,6 +54,7 @@ class InvoiceOut(BaseModel):
     amount_paid: float
     match_status: str
     payment_status: str
+    gl_account: str | None = None
     line_items: list[dict[str, Any]]
     created_at: datetime
 
@@ -126,3 +127,22 @@ class PaymentAllocationOut(BaseModel):
 class BatchAllocationSummaryOut(BaseModel):
     proposed_count: int
     allocations: list[PaymentAllocationOut]
+
+
+class GLSuggestRequest(BaseModel):
+    vendor_name: str = ""
+    description: str
+    default_gl: str | None = None
+
+
+class SemanticSearchRequest(BaseModel):
+    query: str
+    entity_type: Literal["invoice", "purchase_order"] = "invoice"
+    top_k: int = 5
+
+
+class SemanticSearchHitOut(BaseModel):
+    entity_type: str
+    entity_id: str
+    score: float
+    source_text: str

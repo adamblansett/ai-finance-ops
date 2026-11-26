@@ -1,7 +1,7 @@
 import json
 
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import Actor, get_current_actor, require_roles
@@ -15,6 +15,7 @@ from app.ingestion.schemas import (
     IngestionPayloadRequest,
     IngestionResultOut,
 )
+from app.llm.embeddings import EmbeddingService, get_embedding_service
 from app.llm.router import LLMRouter, get_llm_router
 
 router = APIRouter(prefix="/ingestion", tags=["ingestion"])
@@ -29,11 +30,21 @@ def _resolve_settings(request: Request, fallback: Settings) -> Settings:
 
 @router.get("/documents", response_model=list[IngestedDocumentOut])
 async def list_ingested_documents(
+    response: Response,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
     _: Actor = Depends(get_current_actor),
 ) -> list[IngestedDocumentOut]:
     """List ingested documents and duplicate-block attempts newest first."""
-    stmt = select(IngestedDocument).order_by(IngestedDocument.created_at.desc())
+    total = int((await db.scalar(select(func.count(IngestedDocument.id)))) or 0)
+    response.headers["X-Total-Count"] = str(total)
+    stmt = (
+        select(IngestedDocument)
+        .order_by(IngestedDocument.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
     rows = (await db.execute(stmt)).scalars().all()
     return [to_document_out(r) for r in rows]
 
@@ -46,10 +57,11 @@ async def upload_document(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
     llm_router: LLMRouter = Depends(get_llm_router),
+    embedding_service: EmbeddingService = Depends(get_embedding_service),
     settings: Settings = Depends(get_settings),
     actor: Actor = Depends(require_roles("analyst", "controller", "admin")),
 ) -> IngestionResultOut:
-    """Upload a CSV, JSON, or PDF document with SHA-256 duplicate protection."""
+    """Upload a CSV, JSON, OFX, or PDF document with SHA-256 duplicate protection."""
     raw_bytes = await file.read()
     cfg = _resolve_settings(request, settings)
     return await ingest_bytes(
@@ -62,6 +74,7 @@ async def upload_document(
         settings=cfg,
         actor=actor,
         auto_reconcile=auto_reconcile,
+        embedding_service=embedding_service,
     )
 
 
@@ -71,6 +84,7 @@ async def ingest_inline_payload(
     request: Request,
     db: AsyncSession = Depends(get_db),
     llm_router: LLMRouter = Depends(get_llm_router),
+    embedding_service: EmbeddingService = Depends(get_embedding_service),
     settings: Settings = Depends(get_settings),
     actor: Actor = Depends(require_roles("analyst", "controller", "admin")),
 ) -> IngestionResultOut:
@@ -91,4 +105,5 @@ async def ingest_inline_payload(
         settings=cfg,
         actor=actor,
         auto_reconcile=payload.auto_reconcile,
+        embedding_service=embedding_service,
     )

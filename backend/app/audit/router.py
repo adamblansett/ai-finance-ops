@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit.policy import audit_and_persist_expense, reaudit_existing_expense
@@ -82,14 +82,39 @@ def _to_approval_out(row: ApprovalRequest) -> ApprovalOut:
 
 @router.get("/expenses", response_model=list[ExpenseOut])
 async def list_expenses(
+    response: Response,
     status_filter: str | None = Query(default=None, alias="status"),
+    search: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
     _: Actor = Depends(get_current_actor),
 ) -> list[ExpenseOut]:
-    """List submitted expenses newest first, optionally filtered by status."""
-    stmt = select(Expense).order_by(Expense.expense_date.desc(), Expense.created_at.desc())
+    """List submitted expenses newest first with pagination and search."""
+    stmt = select(Expense)
+    count_stmt = select(func.count(Expense.id))
     if status_filter:
-        stmt = stmt.where(Expense.status == status_filter.strip().lower())
+        st = status_filter.strip().lower()
+        stmt = stmt.where(Expense.status == st)
+        count_stmt = count_stmt.where(Expense.status == st)
+    if search and search.strip():
+        pat = f"%{search.strip()}%"
+        cond = or_(
+            Expense.merchant.ilike(pat),
+            Expense.employee_name.ilike(pat),
+            Expense.category.ilike(pat),
+            Expense.description.ilike(pat),
+        )
+        stmt = stmt.where(cond)
+        count_stmt = count_stmt.where(cond)
+
+    total = int((await db.scalar(count_stmt)) or 0)
+    response.headers["X-Total-Count"] = str(total)
+    stmt = (
+        stmt.order_by(Expense.expense_date.desc(), Expense.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
     rows = (await db.execute(stmt)).scalars().all()
     return [_to_expense_out(r) for r in rows]
 
@@ -148,17 +173,29 @@ async def reaudit_expense(
 
 @router.get("/approvals", response_model=list[ApprovalOut])
 async def list_approvals(
+    response: Response,
     status_filter: str | None = Query(default=None, alias="status"),
     entity_type: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
     _: Actor = Depends(get_current_actor),
 ) -> list[ApprovalOut]:
-    """List HITL controller approval requests."""
-    stmt = select(ApprovalRequest).order_by(ApprovalRequest.created_at.desc())
+    """List HITL controller approval requests with pagination."""
+    stmt = select(ApprovalRequest)
+    count_stmt = select(func.count(ApprovalRequest.id))
     if status_filter:
-        stmt = stmt.where(ApprovalRequest.status == status_filter.strip().lower())
+        st = status_filter.strip().lower()
+        stmt = stmt.where(ApprovalRequest.status == st)
+        count_stmt = count_stmt.where(ApprovalRequest.status == st)
     if entity_type:
-        stmt = stmt.where(ApprovalRequest.entity_type == entity_type.strip().lower())
+        et = entity_type.strip().lower()
+        stmt = stmt.where(ApprovalRequest.entity_type == et)
+        count_stmt = count_stmt.where(ApprovalRequest.entity_type == et)
+
+    total = int((await db.scalar(count_stmt)) or 0)
+    response.headers["X-Total-Count"] = str(total)
+    stmt = stmt.order_by(ApprovalRequest.created_at.desc()).offset(offset).limit(limit)
     rows = (await db.execute(stmt)).scalars().all()
     return [_to_approval_out(r) for r in rows]
 
@@ -183,18 +220,40 @@ async def decide_approval_endpoint(
 
 @router.get("/events", response_model=list[AuditEventOut])
 async def list_audit_events(
+    response: Response,
     entity_type: str | None = Query(default=None),
     event_type: str | None = Query(default=None),
+    search: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
     _: Actor = Depends(get_current_actor),
 ) -> list[AuditEventOut]:
-    """List immutable SOX audit trail events newest first."""
-    stmt = select(AuditEvent).order_by(AuditEvent.sequence_no.desc()).limit(limit)
+    """List immutable SOX audit trail events newest first with pagination."""
+    stmt = select(AuditEvent)
+    count_stmt = select(func.count(AuditEvent.id))
     if entity_type:
-        stmt = stmt.where(AuditEvent.entity_type == entity_type.strip().lower())
+        et = entity_type.strip().lower()
+        stmt = stmt.where(AuditEvent.entity_type == et)
+        count_stmt = count_stmt.where(AuditEvent.entity_type == et)
     if event_type:
-        stmt = stmt.where(AuditEvent.event_type == event_type.strip())
+        ev_t = event_type.strip()
+        stmt = stmt.where(AuditEvent.event_type == ev_t)
+        count_stmt = count_stmt.where(AuditEvent.event_type == ev_t)
+    if search and search.strip():
+        pat = f"%{search.strip()}%"
+        cond = or_(
+            AuditEvent.event_type.ilike(pat),
+            AuditEvent.actor_email.ilike(pat),
+            AuditEvent.action.ilike(pat),
+            AuditEvent.entity_id.ilike(pat),
+        )
+        stmt = stmt.where(cond)
+        count_stmt = count_stmt.where(cond)
+
+    total = int((await db.scalar(count_stmt)) or 0)
+    response.headers["X-Total-Count"] = str(total)
+    stmt = stmt.order_by(AuditEvent.sequence_no.desc()).offset(offset).limit(limit)
     rows = (await db.execute(stmt)).scalars().all()
     return [
         AuditEventOut(

@@ -3,6 +3,46 @@ export type ActorRole = 'viewer' | 'analyst' | 'controller' | 'admin';
 export interface ActorContext {
   email: string;
   role: ActorRole;
+  token?: string;
+}
+
+export interface AuthTokenResponse {
+  access_token: string;
+  refresh_token?: string | null;
+  token_type: string;
+  actor: {
+    email: string;
+    role: ActorRole;
+    auth_method: string;
+  };
+}
+
+export interface BackgroundJobItem {
+  id: string;
+  job_type: string;
+  status: string;
+  progress_pct: number;
+  payload: Record<string, unknown>;
+  result: Record<string, unknown>;
+  error_message: string | null;
+  created_by: string;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface GLSuggestion {
+  gl_account: string;
+  gl_name: string;
+  confidence: number;
+  reason: string;
+}
+
+export interface SemanticSearchHit {
+  entity_type: string;
+  entity_id: string;
+  score: number;
+  source_text: string;
 }
 
 export interface HealthStatus {

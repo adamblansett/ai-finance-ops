@@ -3,6 +3,8 @@ import type {
   ApprovalRequestItem,
   AuditChainVerify,
   AuditEventItem,
+  AuthTokenResponse,
+  BackgroundJobItem,
   BankTransaction,
   CashAccount,
   DocType,
@@ -10,6 +12,7 @@ import type {
   ExpenseItem,
   ForecastResponse,
   ForecastScenario,
+  GLSuggestion,
   HealthStatus,
   IngestedDocument,
   IngestionResult,
@@ -18,6 +21,7 @@ import type {
   PiiRedactResult,
   RecurringCommitment,
   SeedSummary,
+  SemanticSearchHit,
   ThreeWayMatch,
 } from '../types/finance';
 
@@ -37,8 +41,12 @@ async function requestJson<T>(
   init: RequestInit = {},
 ): Promise<T> {
   const headers = new Headers(init.headers);
-  headers.set('X-Actor-Email', actor.email);
-  headers.set('X-Actor-Role', actor.role);
+  if (actor.token) {
+    headers.set('Authorization', `Bearer ${actor.token}`);
+  } else {
+    headers.set('X-Actor-Email', actor.email);
+    headers.set('X-Actor-Role', actor.role);
+  }
   if (init.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
@@ -216,6 +224,99 @@ export function createCommitment(
 
 export function fetchCashAccounts(actor: ActorContext): Promise<CashAccount[]> {
   return requestJson<CashAccount[]>('/api/v1/forecasting/accounts', actor);
+}
+
+export async function loginWithPassword(
+  email: string,
+  password: string,
+): Promise<AuthTokenResponse> {
+  const response = await fetch('/api/v1/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!response.ok) {
+    let message = `Login failed (${response.status})`;
+    try {
+      const data = (await response.json()) as { detail?: string };
+      if (typeof data.detail === 'string') message = data.detail;
+    } catch {
+      // ignore non-JSON error body
+    }
+    throw new ApiClientError(message, response.status);
+  }
+  return (await response.json()) as AuthTokenResponse;
+}
+
+export function fetchJobs(actor: ActorContext): Promise<BackgroundJobItem[]> {
+  return requestJson<BackgroundJobItem[]>('/api/v1/jobs', actor);
+}
+
+export function enqueueReconcileJob(actor: ActorContext): Promise<BackgroundJobItem> {
+  return requestJson<BackgroundJobItem>('/api/v1/jobs/reconcile-batch', actor, {
+    method: 'POST',
+  });
+}
+
+export function enqueueApArJob(actor: ActorContext): Promise<BackgroundJobItem> {
+  return requestJson<BackgroundJobItem>('/api/v1/jobs/ap-ar-match', actor, {
+    method: 'POST',
+  });
+}
+
+export function enqueueForecastJob(actor: ActorContext): Promise<BackgroundJobItem> {
+  return requestJson<BackgroundJobItem>('/api/v1/jobs/forecast-snapshot', actor, {
+    method: 'POST',
+  });
+}
+
+export function suggestGlAccount(
+  actor: ActorContext,
+  vendorName: string,
+  description: string,
+): Promise<GLSuggestion> {
+  return requestJson<GLSuggestion>('/api/v1/reconciliation/gl-suggest', actor, {
+    method: 'POST',
+    body: JSON.stringify({ vendor_name: vendorName, description }),
+  });
+}
+
+export function semanticSearch(
+  actor: ActorContext,
+  query: string,
+  entityType: 'invoice' | 'purchase_order' = 'invoice',
+): Promise<SemanticSearchHit[]> {
+  return requestJson<SemanticSearchHit[]>('/api/v1/reconciliation/semantic-search', actor, {
+    method: 'POST',
+    body: JSON.stringify({ query, entity_type: entityType, top_k: 5 }),
+  });
+}
+
+export async function downloadExportFile(
+  actor: ActorContext,
+  path: string,
+  filename: string,
+): Promise<void> {
+  const headers = new Headers();
+  if (actor.token) {
+    headers.set('Authorization', `Bearer ${actor.token}`);
+  } else {
+    headers.set('X-Actor-Email', actor.email);
+    headers.set('X-Actor-Role', actor.role);
+  }
+  const response = await fetch(path, { headers });
+  if (!response.ok) {
+    throw new ApiClientError(`Export failed (${response.status})`, response.status);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
 }
 
 export function formatCurrency(amount: number): string {

@@ -101,6 +101,7 @@ class Invoice(Base):
         ForeignKey("ingested_documents.id"), nullable=True
     )
     line_items_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    gl_account: Mapped[str | None] = mapped_column(String(64), nullable=True)
     match_status: Mapped[str] = mapped_column(String(32), default="unmatched", index=True)
     payment_status: Mapped[str] = mapped_column(String(32), default="unpaid", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -257,4 +258,45 @@ class AuditEvent(Base):
     details_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     prev_hash: Mapped[str] = mapped_column(String(64))
     event_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    email: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    full_name: Mapped[str] = mapped_column(String(160))
+    role: Mapped[str] = mapped_column(String(32), default="analyst")
+    password_hash: Mapped[str] = mapped_column(String(256))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class BackgroundJob(Base):
+    __tablename__ = "background_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    job_type: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    progress_pct: Mapped[int] = mapped_column(Integer, default=0)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SemanticEmbedding(Base):
+    __tablename__ = "semantic_embeddings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    entity_type: Mapped[str] = mapped_column(String(40), index=True)
+    entity_id: Mapped[str] = mapped_column(String(36), index=True)
+    source_text: Mapped[str] = mapped_column(Text)
+    provider: Mapped[str] = mapped_column(String(32), default="deterministic")
+    dimensions: Mapped[int] = mapped_column(Integer, default=384)
+    vector_json: Mapped[list[float]] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

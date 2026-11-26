@@ -236,6 +236,29 @@ function buildApiMock() {
     if (url === '/api/v1/forecasting/commitments') {
       return jsonResponse([]);
     }
+    if (url === '/api/v1/jobs') {
+      return jsonResponse([]);
+    }
+    if (url === '/api/v1/reconciliation/gl-suggest') {
+      return jsonResponse({
+        gl_account: '6100-CLOUD',
+        gl_name: 'Cloud & Infrastructure Hosting',
+        confidence: 0.91,
+        reason: 'Matched cloud hosting',
+      });
+    }
+    if (url === '/api/v1/auth/login') {
+      return jsonResponse({
+        access_token: 'fake.jwt.token',
+        refresh_token: 'fake.refresh.token',
+        token_type: 'bearer',
+        actor: {
+          email: 'controller@acme-finops.local',
+          role: 'controller',
+          auth_method: 'bearer_token',
+        },
+      });
+    }
     return jsonResponse({});
   });
 }
@@ -283,6 +306,16 @@ describe('AI Finance Operations workspace', () => {
     fireEvent.click(screen.getByRole('button', { name: /Run Scenario/i }));
     await waitFor(() => {
       expect(screen.getByText('$485,000.00')).toBeInTheDocument();
+    });
+
+    // Navigate to Jobs & Exports and test GL suggestion
+    fireEvent.click(screen.getByRole('button', { name: /Jobs & Exports/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/Semantic GL Account Coder/i)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Suggest GL Code/i }));
+    await waitFor(() => {
+      expect(screen.getByText('6100-CLOUD')).toBeInTheDocument();
     });
 
     // Navigate to SOX Audit & PII and test redaction preview

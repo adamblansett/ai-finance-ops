@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Check, RefreshCw, X } from 'lucide-react';
+import { Check, RefreshCw, Search, X } from 'lucide-react';
 import { decideApproval, formatCurrency, runMatchAll } from '../api/client';
 import type { ActorContext, ApprovalRequestItem, ThreeWayMatch } from '../types/finance';
 import { StatusBadge } from './StatusBadge';
@@ -20,13 +20,23 @@ export function ReconciliationView({
   onNotify,
 }: ReconciliationViewProps) {
   const [filter, setFilter] = useState<string>('all');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [notesById, setNotesById] = useState<Record<string, string>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
   const [runningBatch, setRunningBatch] = useState(false);
 
   const approvalMap = new Map(approvals.map((a) => [a.id, a]));
   const canDecide = actor.role === 'controller' || actor.role === 'admin';
 
-  const filtered = matches.filter((m) => (filter === 'all' ? true : m.status === filter));
+  const filtered = matches.filter((m) => {
+    if (filter !== 'all' && m.status !== filter) return false;
+    if (searchTerm.trim()) {
+      const q = searchTerm.trim().toLowerCase();
+      const hay = `${m.invoice_number || ''} ${m.counterparty_name || ''} ${m.po_number || ''}`.toLowerCase();
+      return hay.includes(q);
+    }
+    return true;
+  });
 
   async function handleRunMatchAll() {
     setRunningBatch(true);
@@ -44,12 +54,9 @@ export function ReconciliationView({
   async function handleDecision(approvalId: string, decision: 'approved' | 'rejected') {
     setBusyId(approvalId);
     try {
-      await decideApproval(
-        actor,
-        approvalId,
-        decision,
-        `${decision} in 3-way reconciliation queue`,
-      );
+      const noteText =
+        notesById[approvalId]?.trim() || `${decision} in 3-way reconciliation queue`;
+      await decideApproval(actor, approvalId, decision, noteText);
       onNotify(`Invoice match ${decision}.`);
       await onRefresh();
     } catch (err) {
@@ -80,15 +87,28 @@ export function ReconciliationView({
             ),
           )}
         </div>
-        <button
-          type="button"
-          onClick={handleRunMatchAll}
-          disabled={runningBatch}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
-        >
-          <RefreshCw className={`h-3.5 w-3.5 ${runningBatch ? 'animate-spin' : ''}`} />
-          Run 3-Way Match All
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-2 h-3.5 w-3.5 text-slate-400" />
+            <input
+              type="text"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              placeholder="Search invoice or vendor..."
+              aria-label="Search reconciliation matches"
+              className="rounded-lg border border-slate-300 py-1.5 pl-8 pr-3 text-xs"
+            />
+          </div>
+          <button
+            type="button"
+            onClick={handleRunMatchAll}
+            disabled={runningBatch}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${runningBatch ? 'animate-spin' : ''}`} />
+            Run 3-Way Match All
+          </button>
+        </div>
       </div>
 
       {!canDecide && (
@@ -169,7 +189,17 @@ export function ReconciliationView({
                   </p>
 
                   {isPending && approval && (
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        type="text"
+                        value={notesById[approval.id] || ''}
+                        onChange={(e) =>
+                          setNotesById({ ...notesById, [approval.id]: e.target.value })
+                        }
+                        placeholder="Decision note (optional)"
+                        aria-label={`Decision note for ${m.invoice_number}`}
+                        className="rounded-lg border border-slate-300 px-2.5 py-1 text-xs"
+                      />
                       <button
                         type="button"
                         disabled={busyId === approval.id}

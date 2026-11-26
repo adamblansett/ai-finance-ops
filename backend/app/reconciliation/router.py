@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import Actor, get_current_actor, require_roles
@@ -14,17 +14,22 @@ from app.db.models import (
     Vendor,
 )
 from app.db.session import get_db
+from app.llm.embeddings import EmbeddingService, find_similar_entities, get_embedding_service
 from app.llm.router import LLMRouter, get_llm_router
 from app.reconciliation.ap_ar import propose_payment_allocations
+from app.reconciliation.gl_coding import GLSuggestionOut, suggest_gl_account
 from app.reconciliation.schemas import (
     BankTransactionOut,
     BatchAllocationSummaryOut,
     BatchMatchSummaryOut,
+    GLSuggestRequest,
     GoodsReceiptOut,
     InvoiceOut,
     MatchAnomalyOut,
     PaymentAllocationOut,
     PurchaseOrderOut,
+    SemanticSearchHitOut,
+    SemanticSearchRequest,
     ThreeWayMatchOut,
     VendorOut,
 )
@@ -43,9 +48,38 @@ def _resolve_settings(request: Request, fallback: Settings) -> Settings:
 async def _hydrate_matches(db: AsyncSession, rows: list[ThreeWayMatch]) -> list[ThreeWayMatchOut]:
     if not rows:
         return []
-    inv_map = {r.id: r for r in (await db.execute(select(Invoice))).scalars().all()}
-    po_map = {r.id: r for r in (await db.execute(select(PurchaseOrder))).scalars().all()}
-    rec_map = {r.id: r for r in (await db.execute(select(GoodsReceipt))).scalars().all()}
+    inv_ids = {r.invoice_id for r in rows}
+    po_ids = {r.po_id for r in rows if r.po_id}
+    rec_ids = {r.receipt_id for r in rows if r.receipt_id}
+
+    inv_map = {
+        r.id: r
+        for r in (await db.execute(select(Invoice).where(Invoice.id.in_(inv_ids)))).scalars().all()
+    }
+    po_map = (
+        {
+            r.id: r
+            for r in (
+                await db.execute(select(PurchaseOrder).where(PurchaseOrder.id.in_(po_ids)))
+            )
+            .scalars()
+            .all()
+        }
+        if po_ids
+        else {}
+    )
+    rec_map = (
+        {
+            r.id: r
+            for r in (
+                await db.execute(select(GoodsReceipt).where(GoodsReceipt.id.in_(rec_ids)))
+            )
+            .scalars()
+            .all()
+        }
+        if rec_ids
+        else {}
+    )
 
     output: list[ThreeWayMatchOut] = []
     for row in rows:
@@ -93,8 +127,21 @@ async def _hydrate_allocations(
 ) -> list[PaymentAllocationOut]:
     if not rows:
         return []
-    tx_map = {r.id: r for r in (await db.execute(select(BankTransaction))).scalars().all()}
-    inv_map = {r.id: r for r in (await db.execute(select(Invoice))).scalars().all()}
+    tx_ids = {r.bank_transaction_id for r in rows}
+    inv_ids = {r.invoice_id for r in rows}
+
+    tx_map = {
+        r.id: r
+        for r in (
+            await db.execute(select(BankTransaction).where(BankTransaction.id.in_(tx_ids)))
+        )
+        .scalars()
+        .all()
+    }
+    inv_map = {
+        r.id: r
+        for r in (await db.execute(select(Invoice).where(Invoice.id.in_(inv_ids)))).scalars().all()
+    }
 
     result: list[PaymentAllocationOut] = []
     for row in rows:
@@ -191,16 +238,42 @@ async def list_goods_receipts(
 
 @router.get("/invoices", response_model=list[InvoiceOut])
 async def list_invoices(
+    response: Response,
     direction: str | None = Query(default=None),
     match_status: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
     _: Actor = Depends(get_current_actor),
 ) -> list[InvoiceOut]:
-    stmt = select(Invoice).order_by(Invoice.due_date.asc(), Invoice.created_at.desc())
+    stmt = select(Invoice)
+    count_stmt = select(func.count(Invoice.id))
     if direction:
-        stmt = stmt.where(Invoice.direction == direction.strip().lower())
+        d = direction.strip().lower()
+        stmt = stmt.where(Invoice.direction == d)
+        count_stmt = count_stmt.where(Invoice.direction == d)
     if match_status:
-        stmt = stmt.where(Invoice.match_status == match_status.strip().lower())
+        ms = match_status.strip().lower()
+        stmt = stmt.where(Invoice.match_status == ms)
+        count_stmt = count_stmt.where(Invoice.match_status == ms)
+    if search and search.strip():
+        pat = f"%{search.strip()}%"
+        cond = or_(
+            Invoice.invoice_number.ilike(pat),
+            Invoice.counterparty_name.ilike(pat),
+            Invoice.po_number.ilike(pat),
+        )
+        stmt = stmt.where(cond)
+        count_stmt = count_stmt.where(cond)
+
+    total = int((await db.scalar(count_stmt)) or 0)
+    response.headers["X-Total-Count"] = str(total)
+    stmt = (
+        stmt.order_by(Invoice.due_date.asc(), Invoice.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
     rows = (await db.execute(stmt)).scalars().all()
     return [
         InvoiceOut(
@@ -219,6 +292,7 @@ async def list_invoices(
             amount_paid=float(r.amount_paid),
             match_status=r.match_status,
             payment_status=r.payment_status,
+            gl_account=r.gl_account,
             line_items=r.line_items_json,
             created_at=r.created_at,
         )
@@ -232,6 +306,7 @@ async def match_single_invoice(
     request: Request,
     db: AsyncSession = Depends(get_db),
     llm_router: LLMRouter = Depends(get_llm_router),
+    embedding_service: EmbeddingService = Depends(get_embedding_service),
     settings: Settings = Depends(get_settings),
     actor: Actor = Depends(require_roles("analyst", "controller", "admin")),
 ) -> ThreeWayMatchOut:
@@ -248,6 +323,7 @@ async def match_single_invoice(
         llm_router=llm_router,
         settings=cfg,
         actor=actor,
+        embedding_service=embedding_service,
     )
     await db.commit()
     hydrated = await _hydrate_matches(db, [match])
@@ -259,6 +335,7 @@ async def match_all_payable_invoices(
     request: Request,
     db: AsyncSession = Depends(get_db),
     llm_router: LLMRouter = Depends(get_llm_router),
+    embedding_service: EmbeddingService = Depends(get_embedding_service),
     settings: Settings = Depends(get_settings),
     actor: Actor = Depends(require_roles("analyst", "controller", "admin")),
 ) -> BatchMatchSummaryOut:
@@ -281,6 +358,7 @@ async def match_all_payable_invoices(
                 llm_router=llm_router,
                 settings=cfg,
                 actor=actor,
+                embedding_service=embedding_service,
             )
         )
     await db.commit()
@@ -296,26 +374,55 @@ async def match_all_payable_invoices(
 
 @router.get("/matches", response_model=list[ThreeWayMatchOut])
 async def list_three_way_matches(
+    response: Response,
     status_filter: str | None = Query(default=None, alias="status"),
+    search: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
     _: Actor = Depends(get_current_actor),
 ) -> list[ThreeWayMatchOut]:
-    stmt = select(ThreeWayMatch).order_by(ThreeWayMatch.updated_at.desc())
+    stmt = select(ThreeWayMatch)
+    count_stmt = select(func.count(ThreeWayMatch.id))
     if status_filter:
-        stmt = stmt.where(ThreeWayMatch.status == status_filter.strip().lower())
+        st = status_filter.strip().lower()
+        stmt = stmt.where(ThreeWayMatch.status == st)
+        count_stmt = count_stmt.where(ThreeWayMatch.status == st)
+    if search and search.strip():
+        pat = f"%{search.strip()}%"
+        inv_ids_subq = select(Invoice.id).where(
+            or_(Invoice.invoice_number.ilike(pat), Invoice.counterparty_name.ilike(pat))
+        )
+        cond = ThreeWayMatch.invoice_id.in_(inv_ids_subq)
+        stmt = stmt.where(cond)
+        count_stmt = count_stmt.where(cond)
+
+    total = int((await db.scalar(count_stmt)) or 0)
+    response.headers["X-Total-Count"] = str(total)
+    stmt = stmt.order_by(ThreeWayMatch.updated_at.desc()).offset(offset).limit(limit)
     rows = list((await db.execute(stmt)).scalars().all())
     return await _hydrate_matches(db, rows)
 
 
 @router.get("/bank-transactions", response_model=list[BankTransactionOut])
 async def list_bank_transactions(
+    response: Response,
     status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
     _: Actor = Depends(get_current_actor),
 ) -> list[BankTransactionOut]:
-    stmt = select(BankTransaction).order_by(BankTransaction.transaction_date.desc())
+    stmt = select(BankTransaction)
+    count_stmt = select(func.count(BankTransaction.id))
     if status_filter:
-        stmt = stmt.where(BankTransaction.status == status_filter.strip().lower())
+        st = status_filter.strip().lower()
+        stmt = stmt.where(BankTransaction.status == st)
+        count_stmt = count_stmt.where(BankTransaction.status == st)
+
+    total = int((await db.scalar(count_stmt)) or 0)
+    response.headers["X-Total-Count"] = str(total)
+    stmt = stmt.order_by(BankTransaction.transaction_date.desc()).offset(offset).limit(limit)
     rows = (await db.execute(stmt)).scalars().all()
     return [
         BankTransactionOut(
@@ -348,12 +455,63 @@ async def run_ap_ar_matching(
 
 @router.get("/allocations", response_model=list[PaymentAllocationOut])
 async def list_payment_allocations(
+    response: Response,
     status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
     _: Actor = Depends(get_current_actor),
 ) -> list[PaymentAllocationOut]:
-    stmt = select(PaymentAllocation).order_by(PaymentAllocation.created_at.desc())
+    stmt = select(PaymentAllocation)
+    count_stmt = select(func.count(PaymentAllocation.id))
     if status_filter:
-        stmt = stmt.where(PaymentAllocation.status == status_filter.strip().lower())
+        st = status_filter.strip().lower()
+        stmt = stmt.where(PaymentAllocation.status == st)
+        count_stmt = count_stmt.where(PaymentAllocation.status == st)
+
+    total = int((await db.scalar(count_stmt)) or 0)
+    response.headers["X-Total-Count"] = str(total)
+    stmt = stmt.order_by(PaymentAllocation.created_at.desc()).offset(offset).limit(limit)
     rows = list((await db.execute(stmt)).scalars().all())
     return await _hydrate_allocations(db, rows)
+
+
+@router.post("/gl-suggest", response_model=GLSuggestionOut)
+async def suggest_gl_code(
+    payload: GLSuggestRequest,
+    embedding_service: EmbeddingService = Depends(get_embedding_service),
+    _: Actor = Depends(get_current_actor),
+) -> GLSuggestionOut:
+    """Suggest Chart-of-Accounts GL coding via semantic similarity."""
+    return await suggest_gl_account(
+        description=payload.description,
+        vendor_name=payload.vendor_name,
+        default_gl=payload.default_gl,
+        embedding_service=embedding_service,
+    )
+
+
+@router.post("/semantic-search", response_model=list[SemanticSearchHitOut])
+async def semantic_search(
+    payload: SemanticSearchRequest,
+    db: AsyncSession = Depends(get_db),
+    embedding_service: EmbeddingService = Depends(get_embedding_service),
+    _: Actor = Depends(get_current_actor),
+) -> list[SemanticSearchHitOut]:
+    """Search invoices or purchase orders by vector cosine similarity."""
+    hits = await find_similar_entities(
+        db,
+        entity_type=payload.entity_type,
+        query_text=payload.query,
+        embedding_service=embedding_service,
+        top_k=payload.top_k,
+    )
+    return [
+        SemanticSearchHitOut(
+            entity_type=row.entity_type,
+            entity_id=row.entity_id,
+            score=score,
+            source_text=row.source_text,
+        )
+        for row, score in hits
+    ]

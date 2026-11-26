@@ -10,11 +10,13 @@ from app.audit.schemas import ExpenseCreate
 from app.audit.service import record_audit_event
 from app.core.auth import Actor
 from app.core.config import Settings
+from app.core.passwords import hash_password
 from app.core.text import normalize_counterparty
 from app.db.base import utcnow
 from app.db.models import (
     ApprovalRequest,
     AuditEvent,
+    BackgroundJob,
     BankTransaction,
     CashAccountSnapshot,
     Expense,
@@ -24,9 +26,12 @@ from app.db.models import (
     PaymentAllocation,
     PurchaseOrder,
     RecurringCommitment,
+    SemanticEmbedding,
     ThreeWayMatch,
+    User,
     Vendor,
 )
+from app.llm.embeddings import EmbeddingService, upsert_embedding
 from app.llm.router import LLMRouter
 from app.reconciliation.ap_ar import propose_payment_allocations
 from app.reconciliation.three_way import run_three_way_match
@@ -98,6 +103,8 @@ async def seed_demo_dataset(
     if reset:
         for model in (
             AuditEvent,
+            SemanticEmbedding,
+            BackgroundJob,
             ThreeWayMatch,
             PaymentAllocation,
             Expense,
@@ -113,6 +120,35 @@ async def seed_demo_dataset(
         ):
             await db.execute(delete(model))
         await db.flush()
+
+    for demo_email, demo_name, demo_role, demo_pw in (
+        (
+            "controller@acme-finops.local",
+            "Morgan Blake (Controller)",
+            "controller",
+            "ControllerDemo123!",
+        ),
+        (
+            "analyst@acme-finops.local",
+            "Alex Rivera (Analyst)",
+            "analyst",
+            "AnalystDemo123!",
+        ),
+    ):
+        existing_user = (
+            await db.execute(select(User).where(User.email == demo_email))
+        ).scalar_one_or_none()
+        if existing_user is None:
+            db.add(
+                User(
+                    email=demo_email,
+                    full_name=demo_name,
+                    role=demo_role,
+                    password_hash=hash_password(demo_pw),
+                    is_active=True,
+                )
+            )
+    await db.flush()
 
     now = utcnow()
     today = now.date()
@@ -340,6 +376,17 @@ async def seed_demo_dataset(
     db.add_all([*ap_invoices, *ar_invoices])
     await db.flush()
 
+    emb_svc = EmbeddingService(settings)
+    vendor_by_id = {v.id: v.name for v in vendors}
+    for po in (po_cloud, po_apex, po_vanguard, po_northstar):
+        await upsert_embedding(
+            db,
+            entity_type="purchase_order",
+            entity_id=po.id,
+            source_text=f"{vendor_by_id.get(po.vendor_id, '')} {po.po_number} {po.line_items_json}",
+            embedding_service=emb_svc,
+        )
+
     for inv in ap_invoices:
         await run_three_way_match(
             db,
@@ -347,6 +394,7 @@ async def seed_demo_dataset(
             llm_router=llm_router,
             settings=settings,
             actor=actor,
+            embedding_service=emb_svc,
         )
 
     bank_txs = [

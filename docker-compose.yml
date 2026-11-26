@@ -41,8 +41,12 @@ services:
       AUTO_CREATE_TABLES: ${AUTO_CREATE_TABLES:-true}
       SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
       REDIS_URL: redis://redis:6379/0
+      TASK_EXECUTION_MODE: ${TASK_EXECUTION_MODE:-inline}
       CORS_ORIGINS: http://localhost:3000,http://localhost:5173
       LLM_DEFAULT_PROVIDER: ${LLM_DEFAULT_PROVIDER:-mock}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      OTEL_ENABLED: ${OTEL_ENABLED:-false}
       AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-dev-insecure-secret-change-in-production-32bytes}
     ports:
       - "8000:8000"
@@ -75,6 +79,26 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ai-finance-ops-worker
+    profiles: ["worker"]
+    command: ["python", "-m", "app.jobs.worker"]
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-ai_finance_ops}
+      REDIS_URL: redis://redis:6379/0
+      AUTO_CREATE_TABLES: "false"
+      LLM_DEFAULT_PROVIDER: ${LLM_DEFAULT_PROVIDER:-mock}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   postgres_data:

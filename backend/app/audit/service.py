@@ -1,10 +1,11 @@
+import asyncio
 import hashlib
 import json
 from decimal import Decimal
 from typing import Any, Literal
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit.schemas import AuditChainVerifyOut
@@ -53,6 +54,9 @@ def compute_event_hash(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+_AUDIT_WRITE_LOCK = asyncio.Lock()
+
+
 async def record_audit_event(
     db: AsyncSession,
     *,
@@ -63,40 +67,45 @@ async def record_audit_event(
     action: str,
     details: dict[str, Any] | None = None,
 ) -> AuditEvent:
-    """Append an immutable hash-chained event to the SOX audit log."""
-    stmt = select(AuditEvent).order_by(AuditEvent.sequence_no.desc()).limit(1)
-    latest = (await db.execute(stmt)).scalar_one_or_none()
+    """Append an immutable hash-chained event to the SOX audit log safely."""
+    async with _AUDIT_WRITE_LOCK:
+        conn = await db.connection()
+        if conn.dialect.name == "postgresql":
+            await db.execute(text("SELECT pg_advisory_xact_lock(74291042)"))
 
-    next_seq = (latest.sequence_no + 1) if latest is not None else 1
-    prev_hash = latest.event_hash if latest is not None else "GENESIS"
-    clean_details = details or {}
+        stmt = select(AuditEvent).order_by(AuditEvent.sequence_no.desc()).limit(1)
+        latest = (await db.execute(stmt)).scalar_one_or_none()
 
-    event_hash = compute_event_hash(
-        sequence_no=next_seq,
-        event_type=event_type,
-        actor_email=actor.email,
-        actor_role=actor.role,
-        entity_type=entity_type,
-        entity_id=entity_id,
-        action=action,
-        details=clean_details,
-        prev_hash=prev_hash,
-    )
-    event = AuditEvent(
-        sequence_no=next_seq,
-        event_type=event_type,
-        actor_email=actor.email,
-        actor_role=actor.role,
-        entity_type=entity_type,
-        entity_id=entity_id,
-        action=action,
-        details_json=clean_details,
-        prev_hash=prev_hash,
-        event_hash=event_hash,
-    )
-    db.add(event)
-    await db.flush()
-    return event
+        next_seq = (latest.sequence_no + 1) if latest is not None else 1
+        prev_hash = latest.event_hash if latest is not None else "GENESIS"
+        clean_details = details or {}
+
+        event_hash = compute_event_hash(
+            sequence_no=next_seq,
+            event_type=event_type,
+            actor_email=actor.email,
+            actor_role=actor.role,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            action=action,
+            details=clean_details,
+            prev_hash=prev_hash,
+        )
+        event = AuditEvent(
+            sequence_no=next_seq,
+            event_type=event_type,
+            actor_email=actor.email,
+            actor_role=actor.role,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            action=action,
+            details_json=clean_details,
+            prev_hash=prev_hash,
+            event_hash=event_hash,
+        )
+        db.add(event)
+        await db.flush()
+        return event
 
 
 async def verify_audit_chain(db: AsyncSession) -> AuditChainVerifyOut:

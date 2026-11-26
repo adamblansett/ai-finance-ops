@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import FastAPI, Request
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -19,13 +19,28 @@ from app.db.base import Base
 def build_engine(database_url: str) -> AsyncEngine:
     """Create an async SQLAlchemy engine tuned for SQLite or PostgreSQL."""
     kwargs: dict[str, Any] = {"echo": False}
-    if database_url.startswith("sqlite"):
-        kwargs["connect_args"] = {"check_same_thread": False}
+    is_sqlite = database_url.startswith("sqlite")
+    if is_sqlite:
+        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 15}
         if ":memory:" in database_url:
             kwargs["poolclass"] = StaticPool
     else:
         kwargs["pool_pre_ping"] = True
-    return create_async_engine(database_url, **kwargs)
+    engine = create_async_engine(database_url, **kwargs)
+    if is_sqlite:
+
+        @event.listens_for(engine.sync_engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection: Any, _: Any) -> None:
+            dbapi_connection.isolation_level = None
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA busy_timeout=15000")
+            cursor.close()
+
+        @event.listens_for(engine.sync_engine, "begin")
+        def _sqlite_begin_immediate(conn: Any) -> None:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+
+    return engine
 
 
 def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

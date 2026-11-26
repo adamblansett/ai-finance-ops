@@ -1,14 +1,9 @@
-import csv
-import hashlib
-import io
 import json
 import re
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any
 
 from fastapi import HTTPException, status
-from pypdf import PdfReader
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,153 +22,16 @@ from app.db.models import (
     PurchaseOrder,
     Vendor,
 )
+from app.ingestion.extractors import (
+    extract_records,
+    parse_line_items,
+    parse_money,
+    sha256_bytes,
+)
 from app.ingestion.schemas import DocType, IngestedDocumentOut, IngestionResultOut
+from app.llm.embeddings import EmbeddingService, upsert_embedding
 from app.llm.router import LLMRouter
 from app.reconciliation.three_way import run_three_way_match
-
-
-def sha256_bytes(data: bytes) -> str:
-    """Compute hex SHA-256 digest for raw document bytes."""
-    return hashlib.sha256(data).hexdigest()
-
-
-def _parse_money(value: Any, default: str = "0.00") -> Decimal:
-    if value is None or value == "":
-        return Decimal(default)
-    if isinstance(value, Decimal):
-        return quantize_money(value)
-    cleaned = str(value).replace("$", "").replace(",", "").strip()
-    if not cleaned:
-        return Decimal(default)
-    return quantize_money(cleaned)
-
-
-def _parse_line_items(raw: Any, fallback_qty: Any = None) -> list[dict[str, Any]]:
-    if isinstance(raw, list):
-        return [item for item in raw if isinstance(item, dict)]
-    if isinstance(raw, str) and raw.strip():
-        try:
-            loaded = json.loads(raw)
-            if isinstance(loaded, list):
-                return [item for item in loaded if isinstance(item, dict)]
-        except json.JSONDecodeError:
-            pass
-    if fallback_qty not in (None, ""):
-        try:
-            return [{"description": "Line item", "qty": float(fallback_qty)}]
-        except (TypeError, ValueError):
-            pass
-    return []
-
-
-def parse_csv_records(content: bytes) -> list[dict[str, Any]]:
-    """Parse UTF-8 CSV bytes into normalized record dicts."""
-    text = content.decode("utf-8-sig", errors="replace").strip()
-    if not text:
-        return []
-    reader = csv.DictReader(io.StringIO(text))
-    records: list[dict[str, Any]] = []
-    for row in reader:
-        cleaned = {
-            (k or "").strip(): (v.strip() if isinstance(v, str) else v)
-            for k, v in row.items()
-            if k is not None and k.strip()
-        }
-        if any(v not in (None, "") for v in cleaned.values()):
-            records.append(cleaned)
-    return records
-
-
-def parse_json_records(content: bytes) -> list[dict[str, Any]]:
-    """Parse JSON bytes (object, array, or {'records': [...]}) into record dicts."""
-    loaded = json.loads(content.decode("utf-8-sig"))
-    if isinstance(loaded, list):
-        return [r for r in loaded if isinstance(r, dict)]
-    if isinstance(loaded, dict):
-        if isinstance(loaded.get("records"), list):
-            return [r for r in loaded["records"] if isinstance(r, dict)]
-        return [loaded]
-    raise HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail="JSON payload must be an object, array of objects, or {'records': [...]}.",
-    )
-
-
-def parse_pdf_invoice(content: bytes, filename: str) -> list[dict[str, Any]]:
-    """Extract structured invoice fields from PDF text using pypdf."""
-    try:
-        reader = PdfReader(io.BytesIO(content))
-        text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Failed to parse PDF '{filename}': {exc}",
-        ) from exc
-
-    if not text:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"PDF '{filename}' contained no extractable text.",
-        )
-
-    def _find(pattern: str) -> str | None:
-        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-        return m.group(1).strip() if m else None
-
-    inv_num = _find(r"(?:Invoice\s*(?:Number|No|#)\s*[:#]?\s*)([A-Z0-9-]+)")
-    if not inv_num:
-        inv_num = f"PDF-{sha256_bytes(content)[:8].upper()}"
-    po_num = _find(r"(?:PO\s*(?:Number|No|#)\s*[:#]?\s*)([A-Z0-9-]+)")
-    vendor = _find(r"(?:Vendor|From|Supplier)\s*[:\-]\s*([^\n]+)") or "PDF Imported Vendor"
-    issue_date = _find(r"(?:Issue\s*Date|Invoice\s*Date|Date)\s*[:\-]\s*(\d{4}-\d{2}-\d{2})")
-    due_date = _find(r"(?:Due\s*Date)\s*[:\-]\s*(\d{4}-\d{2}-\d{2})")
-    subtotal_raw = _find(r"(?:Subtotal)\s*[:\-]?\s*\$?([\d,]+\.\d{2})")
-    tax_raw = _find(r"(?:Tax)\s*[:\-]?\s*\$?([\d,]+\.\d{2})")
-    total_raw = _find(r"(?:Total\s*(?:Due|Amount)?)\s*[:\-]?\s*\$?([\d,]+\.\d{2})")
-    qty_raw = _find(r"(?:Qty|Quantity)\s*[:\-]?\s*(\d+(?:\.\d+)?)")
-
-    total = _parse_money(total_raw or subtotal_raw, "0.00")
-    subtotal = _parse_money(subtotal_raw, str(total))
-    tax = _parse_money(tax_raw, "0.00")
-    if total == Decimal("0.00") and subtotal > Decimal("0.00"):
-        total = subtotal + tax
-
-    record: dict[str, Any] = {
-        "invoice_number": inv_num,
-        "direction": "payable",
-        "counterparty_name": vendor,
-        "po_number": po_num,
-        "issue_date": issue_date or utcnow().date().isoformat(),
-        "due_date": due_date,
-        "subtotal": str(subtotal),
-        "tax_amount": str(tax),
-        "total_amount": str(total),
-    }
-    if qty_raw:
-        record["line_items"] = [{"description": f"Imported from {filename}", "qty": float(qty_raw)}]
-    return [record]
-
-
-def _extract_records(
-    filename: str,
-    content: bytes,
-    content_type: str,
-    doc_type: DocType,
-) -> list[dict[str, Any]]:
-    lower_name = filename.lower()
-    lower_ct = content_type.lower()
-    if lower_name.endswith(".pdf") or "pdf" in lower_ct or content.lstrip().startswith(b"%PDF"):
-        if doc_type != "invoice":
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="PDF parsing is currently supported for 'invoice' documents.",
-            )
-        return parse_pdf_invoice(content, filename)
-
-    if lower_name.endswith(".json") or "json" in lower_ct or content.lstrip()[:1] in (b"{", b"["):
-        return parse_json_records(content)
-
-    return parse_csv_records(content)
 
 
 async def _get_or_create_vendor(
@@ -192,9 +50,7 @@ async def _get_or_create_vendor(
             return existing
 
     existing_by_name = (
-        await db.execute(
-            select(Vendor).where(func.lower(Vendor.name) == clean_name.lower())
-        )
+        await db.execute(select(Vendor).where(func.lower(Vendor.name) == clean_name.lower()))
     ).scalar_one_or_none()
     if existing_by_name is not None:
         return existing_by_name
@@ -207,11 +63,7 @@ async def _get_or_create_vendor(
     if code_taken is not None:
         generated_code = f"{generated_code[:55]}-{sha256_bytes(clean_name.encode())[:6]}"
 
-    vendor = Vendor(
-        code=generated_code,
-        name=clean_name,
-        tax_id=tax_id,
-    )
+    vendor = Vendor(code=generated_code, name=clean_name, tax_id=tax_id)
     db.add(vendor)
     await db.flush()
     return vendor
@@ -245,6 +97,7 @@ async def ingest_bytes(
     settings: Settings,
     actor: Actor,
     auto_reconcile: bool = True,
+    embedding_service: EmbeddingService | None = None,
 ) -> IngestionResultOut:
     """Parse, duplicate-check via SHA-256, persist, and optionally reconcile uploaded data."""
     if not content.strip():
@@ -308,7 +161,7 @@ async def ingest_bytes(
             },
         )
 
-    records = _extract_records(filename, content, content_type, doc_type)
+    records = extract_records(filename, content, content_type, doc_type)
     if not records:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -329,6 +182,7 @@ async def ingest_bytes(
     db.add(doc)
     await db.flush()
 
+    emb_svc = embedding_service or EmbeddingService(settings)
     created_ids: list[str] = []
     reconciled_match_ids: list[str] = []
     today = utcnow().date()
@@ -355,18 +209,26 @@ async def ingest_bytes(
                 if rec.get("expected_delivery_date")
                 else issue_dt + timedelta(days=7)
             )
+            items = parse_line_items(rec.get("line_items"), rec.get("qty"))
             po = PurchaseOrder(
                 po_number=po_num,
                 vendor_id=vendor.id,
                 issue_date=issue_dt,
                 expected_delivery_date=exp_dt,
                 currency=str(rec.get("currency") or "USD").upper(),
-                total_amount=_parse_money(rec.get("total_amount"), "0.00"),
+                total_amount=parse_money(rec.get("total_amount"), "0.00"),
                 status=str(rec.get("status") or "open"),
-                line_items_json=_parse_line_items(rec.get("line_items"), rec.get("qty")),
+                line_items_json=items,
             )
             db.add(po)
             await db.flush()
+            await upsert_embedding(
+                db,
+                entity_type="purchase_order",
+                entity_id=po.id,
+                source_text=f"{vendor.name} {po.po_number} {items}",
+                embedding_service=emb_svc,
+            )
             created_ids.append(po.id)
 
     elif doc_type == "goods_receipt":
@@ -396,8 +258,8 @@ async def ingest_bytes(
                 po_id=matched_po.id,
                 vendor_id=matched_po.vendor_id,
                 received_date=parse_iso_date(rec.get("received_date"), today),
-                total_amount=_parse_money(rec.get("total_amount"), str(matched_po.total_amount)),
-                line_items_json=_parse_line_items(rec.get("line_items"), rec.get("qty")),
+                total_amount=parse_money(rec.get("total_amount"), str(matched_po.total_amount)),
+                line_items_json=parse_line_items(rec.get("line_items"), rec.get("qty")),
                 notes=rec.get("notes"),
             )
             db.add(gr)
@@ -413,9 +275,7 @@ async def ingest_bytes(
             vendor_id: str | None = None
             if direction == "payable":
                 vendor = await _get_or_create_vendor(
-                    db,
-                    name=counterparty,
-                    code=rec.get("vendor_code"),
+                    db, name=counterparty, code=rec.get("vendor_code")
                 )
                 vendor_id = vendor.id
 
@@ -425,17 +285,15 @@ async def ingest_bytes(
                 if rec.get("due_date")
                 else issue_dt + timedelta(days=30)
             )
-            total = _parse_money(rec.get("total_amount"), "0.00")
-            tax = _parse_money(rec.get("tax_amount"), "0.00")
-            subtotal = _parse_money(rec.get("subtotal"), str(max(Decimal("0.00"), total - tax)))
+            total = parse_money(rec.get("total_amount"), "0.00")
+            tax = parse_money(rec.get("tax_amount"), "0.00")
+            subtotal = parse_money(rec.get("subtotal"), str(max(Decimal("0.00"), total - tax)))
             if total == Decimal("0.00") and subtotal > Decimal("0.00"):
                 total = quantize_money(subtotal + tax)
 
             inv_num = str(rec.get("invoice_number") or f"INV-{doc.id[:8].upper()}").strip()
             inv_po_num = str(rec.get("po_number")).strip() if rec.get("po_number") else None
-            rec_hash = sha256_bytes(
-                json.dumps(rec, sort_keys=True, default=str).encode("utf-8")
-            )
+            rec_hash = sha256_bytes(json.dumps(rec, sort_keys=True, default=str).encode("utf-8"))
 
             invoice = Invoice(
                 invoice_number=inv_num,
@@ -452,7 +310,8 @@ async def ingest_bytes(
                 amount_paid=Decimal("0.00"),
                 content_sha256=rec_hash,
                 source_document_id=doc.id,
-                line_items_json=_parse_line_items(rec.get("line_items"), rec.get("qty")),
+                gl_account=str(rec.get("gl_account")).strip() if rec.get("gl_account") else None,
+                line_items_json=parse_line_items(rec.get("line_items"), rec.get("qty")),
                 match_status="unmatched" if direction == "payable" else "approved",
                 payment_status="unpaid",
             )
@@ -467,6 +326,7 @@ async def ingest_bytes(
                     llm_router=llm_router,
                     settings=settings,
                     actor=actor,
+                    embedding_service=emb_svc,
                 )
                 reconciled_match_ids.append(match.id)
 
@@ -474,10 +334,8 @@ async def ingest_bytes(
         for idx, rec in enumerate(records, start=1):
             desc = str(rec.get("description") or "").strip()
             tx_date = parse_iso_date(rec.get("transaction_date"), today)
-            amount = abs(_parse_money(rec.get("amount"), "0.00"))
-            raw_ref = str(rec.get("external_ref") or "").strip()
-            if not raw_ref:
-                raw_ref = f"TX-{digest[:8].upper()}-{idx}"
+            amount = abs(parse_money(rec.get("amount"), "0.00"))
+            raw_ref = str(rec.get("external_ref") or "").strip() or f"TX-{digest[:8].upper()}-{idx}"
             existing_tx = (
                 await db.execute(
                     select(BankTransaction).where(BankTransaction.external_ref == raw_ref)
@@ -514,17 +372,13 @@ async def ingest_bytes(
                 expense_date=parse_iso_date(rec.get("expense_date"), today),
                 category=str(rec.get("category") or "other"),
                 tax_category=str(rec.get("tax_category") or "deductible_100"),
-                amount=float(_parse_money(rec.get("amount"), "1.00")),
+                amount=float(parse_money(rec.get("amount"), "1.00")),
                 currency=str(rec.get("currency") or "USD"),
                 receipt_hash=rec.get("receipt_hash") or None,
                 description=str(rec.get("description") or ""),
             )
             exp = await audit_and_persist_expense(
-                db,
-                payload=exp_payload,
-                llm_router=llm_router,
-                settings=settings,
-                actor=actor,
+                db, payload=exp_payload, llm_router=llm_router, settings=settings, actor=actor
             )
             created_ids.append(exp.id)
 

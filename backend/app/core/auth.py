@@ -4,7 +4,7 @@ import hmac
 import json
 import time
 from collections.abc import Callable
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from fastapi import Depends, HTTPException, Request, status
 from pydantic import BaseModel
@@ -32,17 +32,18 @@ def _b64url_decode(token_part: str) -> bytes:
     return base64.urlsafe_b64decode(token_part + padding)
 
 
-def create_access_token(
+def _sign_token(
     email: str,
     role: ActorRole,
     secret_key: str,
-    ttl_seconds: int = 3600,
+    ttl_seconds: int,
+    token_type: Literal["access", "refresh"],
 ) -> str:
-    """Create an HMAC-SHA256 signed bearer token."""
     header = _b64url_encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode("utf-8"))
     payload_dict = {
         "sub": email,
         "role": role,
+        "type": token_type,
         "exp": int(time.time()) + ttl_seconds,
     }
     payload = _b64url_encode(json.dumps(payload_dict, sort_keys=True).encode("utf-8"))
@@ -51,8 +52,31 @@ def create_access_token(
     return f"{header}.{payload}.{_b64url_encode(signature)}"
 
 
-def verify_access_token(token: str, secret_key: str) -> Actor:
-    """Validate an HMAC-SHA256 bearer token and return the Actor."""
+def create_access_token(
+    email: str,
+    role: ActorRole,
+    secret_key: str,
+    ttl_seconds: int = 3600,
+) -> str:
+    """Create an HMAC-SHA256 signed access bearer token."""
+    return _sign_token(email, role, secret_key, ttl_seconds, "access")
+
+
+def create_refresh_token(
+    email: str,
+    role: ActorRole,
+    secret_key: str,
+    ttl_seconds: int = 604800,
+) -> str:
+    """Create an HMAC-SHA256 signed refresh token."""
+    return _sign_token(email, role, secret_key, ttl_seconds, "refresh")
+
+
+def _decode_and_verify(
+    token: str,
+    secret_key: str,
+    expected_type: Literal["access", "refresh"],
+) -> Actor:
     parts = token.split(".")
     if len(parts) != 3:
         raise HTTPException(
@@ -66,7 +90,7 @@ def verify_access_token(token: str, secret_key: str) -> Actor:
     try:
         actual_sig = _b64url_decode(sig_b64)
         payload_bytes = _b64url_decode(payload_b64)
-        payload = json.loads(payload_bytes.decode("utf-8"))
+        payload: dict[str, Any] = json.loads(payload_bytes.decode("utf-8"))
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -86,6 +110,13 @@ def verify_access_token(token: str, secret_key: str) -> Actor:
             detail="Authentication token has expired.",
         )
 
+    tok_type = str(payload.get("type") or "access")
+    if tok_type != expected_type:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token type '{tok_type}'; expected '{expected_type}'.",
+        )
+
     email = str(payload.get("sub") or "").strip()
     role_raw = str(payload.get("role") or "").strip().lower()
     if not email or role_raw not in VALID_ROLES:
@@ -95,6 +126,16 @@ def verify_access_token(token: str, secret_key: str) -> Actor:
         )
 
     return Actor(email=email, role=cast(ActorRole, role_raw), auth_method="bearer_token")
+
+
+def verify_access_token(token: str, secret_key: str) -> Actor:
+    """Validate an HMAC-SHA256 access bearer token and return the Actor."""
+    return _decode_and_verify(token, secret_key, "access")
+
+
+def verify_refresh_token(token: str, secret_key: str) -> Actor:
+    """Validate an HMAC-SHA256 refresh token and return the Actor."""
+    return _decode_and_verify(token, secret_key, "refresh")
 
 
 def _resolve_settings(request: Request, settings: Settings | None = None) -> Settings:
